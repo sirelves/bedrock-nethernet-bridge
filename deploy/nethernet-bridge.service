@@ -1,0 +1,27 @@
+[Unit]
+Description=NetherNet -> RakNet bridge for Minecraft Bedrock 26.60+ clients
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Edit -public-ip and -upstream. Open TCP 19132 and UDP 19140 in the firewall.
+ExecStart=/usr/local/bin/nethernet-bridge \
+  -public-ip 203.0.113.10 \
+  -http 0.0.0.0:19132 \
+  -udp 0.0.0.0:19140 \
+  -upstream 127.0.0.1:19132 \
+  -key /var/lib/nethernet-bridge/server-identity.pem
+Restart=always
+RestartSec=3
+
+# Hardening: the bridge only binds its ports and keeps its identity key.
+DynamicUser=yes
+StateDirectory=nethernet-bridge
+WorkingDirectory=/var/lib/nethernet-bridge
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
