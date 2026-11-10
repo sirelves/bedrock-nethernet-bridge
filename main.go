@@ -38,6 +38,7 @@ type config struct {
 	httpAddr, udpAddr, publicIP, upstream, keyFile string
 
 	injectPreJoin bool
+	diag          diagConfig
 }
 
 func main() {
@@ -50,6 +51,7 @@ func main() {
 	flag.BoolVar(&cfg.injectPreJoin, "inject-prejoin", true, "inject JigsawStructureData + VoxelShapes before StartGame when the upstream does not send them (required by 26.60 clients)")
 	debug := flag.Bool("debug", false, "verbose logging (WebRTC/ICE/DTLS/SCTP)")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	cfg.diag.register()
 	flag.Parse()
 
 	if *showVersion {
@@ -141,6 +143,7 @@ func relay(log *slog.Logger, cfg config, nn *nethernet.Conn) {
 	}
 	log.Info("upstream RakNet session open", "local", rk.LocalAddr().String())
 
+	d := cfg.diag.session(log)
 	done := make(chan error, 2)
 
 	// client -> server: verify the Login, then add the 0xfe prefix RakNet expects.
@@ -160,6 +163,7 @@ func relay(log *slog.Logger, cfg config, nn *nethernet.Conn) {
 				g.logged = true
 				log.Info("login verified: Login key matches the NetherNet identity")
 			}
+			d.clientBatch(pk)
 			buf := make([]byte, 0, len(pk)+1)
 			buf = append(buf, 0xfe)
 			buf = append(buf, pk...)
@@ -188,6 +192,10 @@ func relay(log *slog.Logger, cfg config, nn *nethernet.Conn) {
 					batch = nb
 					log.Info("injected JigsawStructureData + VoxelShapes before StartGame")
 				}
+			}
+			batch, keep := d.serverBatch(batch)
+			if !keep {
+				continue
 			}
 			if _, err := nn.Write(batch); err != nil {
 				done <- err
