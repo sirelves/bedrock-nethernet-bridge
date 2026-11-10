@@ -1,0 +1,745 @@
+--- a/src/entity/animation/ArmSwingAnimation.php
++++ b/src/entity/animation/ArmSwingAnimation.php
+@@ -26,8 +26,10 @@
+ 
+ namespace pocketmine\entity\animation;
+ 
++use pocketmine\entity\Human;
+ use pocketmine\entity\Living;
+ use pocketmine\network\mcpe\protocol\ActorEventPacket;
++use pocketmine\network\mcpe\protocol\AnimatePacket;
+ use pocketmine\network\mcpe\protocol\types\ActorEvent;
+ 
+ final class ArmSwingAnimation implements Animation{
+@@ -36,6 +38,9 @@
+ 	public function __construct(private Living $entity){}
+ 
+ 	public function encode() : array{
++		if($this->entity instanceof Human){
++			return [AnimatePacket::create($this->entity->getId(), AnimatePacket::ACTION_SWING_ARM)];
++		}
+ 		return [
+ 			ActorEventPacket::create($this->entity->getId(), ActorEvent::ARM_SWING, 0)
+ 		];
+--- a/src/network/mcpe/NetworkSession.php
++++ b/src/network/mcpe/NetworkSession.php
+@@ -511,6 +511,9 @@
+ 					$packet = $this->packetPool->getPacket($buffer);
+ 					if($packet === null){
+ 						$this->logger->debug("Unknown packet: " . base64_encode($buffer));
++						if($this->getProtocolId() >= \pocketmine\network\mcpe\protocol\ProtocolInfo::PROTOCOL_1_26_62){
++							continue; //26.60 tem pacotes novos (ex.: ServerboundCursorItemDrag 0x166): ignorar, como o BDS
++						}
+ 						throw new PacketHandlingException("Unknown packet received");
+ 					}
+ 					$name = $packet->getName();
+@@ -1071,7 +1074,7 @@
+ 			}
+ 		}
+ 
+-		if(EncryptionContext::$ENABLED){
++		if(EncryptionContext::$ENABLED && $this->ip !== '127.0.0.1'){
+ 			$this->server->getAsyncPool()->submitTask(new PrepareEncryptionTask($clientPubKey, function(string $encryptionKey, string $handshakeJwt) : void{
+ 				if(!$this->connected){
+ 					return;
+--- a/src/network/mcpe/convert/BlockTranslator.php
++++ b/src/network/mcpe/convert/BlockTranslator.php
+@@ -49,6 +49,10 @@
+ 
+ 	private const PATHS = [
+ 		ProtocolInfo::CURRENT_PROTOCOL => [
++			self::CANONICAL_BLOCK_STATES_PATH => '-1.26.62',
++			self::BLOCK_STATE_META_MAP_PATH => '-1.26.62',
++		],
++		ProtocolInfo::PROTOCOL_1_26_45 => [
+ 			self::CANONICAL_BLOCK_STATES_PATH => '',
+ 			self::BLOCK_STATE_META_MAP_PATH => '',
+ 		],
+--- a/src/network/mcpe/convert/ItemTranslator.php
++++ b/src/network/mcpe/convert/ItemTranslator.php
+@@ -182,6 +182,7 @@
+ 
+ 	public static function getItemSchemaId(int $protocolId) : int{
+ 		return match($protocolId){
++			ProtocolInfo::PROTOCOL_1_26_62,
+ 			ProtocolInfo::PROTOCOL_1_26_45,
+ 			ProtocolInfo::PROTOCOL_1_26_40 => 271,
+ 
+--- a/src/network/mcpe/convert/ItemTypeDictionaryFromDataHelper.php
++++ b/src/network/mcpe/convert/ItemTypeDictionaryFromDataHelper.php
+@@ -49,6 +49,7 @@
+ 
+ 	private const PATHS = [
+ 		ProtocolInfo::CURRENT_PROTOCOL => "",
++		ProtocolInfo::PROTOCOL_1_26_45 => "",
+ 		ProtocolInfo::PROTOCOL_1_26_40 => "",
+ 		ProtocolInfo::PROTOCOL_1_26_30 => "-1.26.30",
+ 		ProtocolInfo::PROTOCOL_1_26_20 => "-1.26.20",
+--- a/src/network/mcpe/handler/InGamePacketHandler.php
++++ b/src/network/mcpe/handler/InGamePacketHandler.php
+@@ -283,9 +283,11 @@
+ 			if($packet->hasFlag(PlayerAuthInputFlags::START_JUMPING)){
+ 				$this->player->jump();
+ 			}
+-			if($packet->hasFlag(PlayerAuthInputFlags::MISSED_SWING)){
+-				$this->player->missSwing();
+-			}
++		}
++		// Unlike persistent movement state, this flag describes an action on each
++		// input packet, including successive packets with otherwise identical flags.
++		if($packet->hasFlag(PlayerAuthInputFlags::MISSED_SWING)){
++			$this->player->missSwing();
+ 		}
+ 
+ 		if(!$this->forceMoveSync && $hasMoved){
+@@ -324,7 +326,8 @@
+ 
+ 			$this->inventoryManager->setCurrentItemStackRequestId($useItemTransaction->getRequestId());
+ 			$this->inventoryManager->addRawPredictedSlotChanges($useItemTransaction->getTransactionData()->getActions());
+-			if($this->session->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_30){
++			if($this->session->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_30 && $this->session->getProtocolId() < ProtocolInfo::PROTOCOL_1_26_62){
++				//2225 (1.26.60+) voltou a mandar os dados de uso no ItemInteraction: cai no handleUseItemTransaction
+ 				//1.26.30+ no longer carries use-item data (action type, item in hand, etc.) in
+ 				//PlayerAuthInputPacket's item interaction - it only carries predicted inventory slot
+ 				//changes. The actual use action now arrives via a standalone InventoryTransactionPacket.
+@@ -948,7 +951,14 @@
+ 	}
+ 
+ 	public function handleAnimate(AnimatePacket $packet) : bool{
+-		return true; //Not used
++		// Older clients report arm swings here instead of MISSED_SWING input.
++		// Only relay the authenticated actor's arm animation, not arbitrary actions.
++		if($packet->action === AnimatePacket::ACTION_SWING_ARM
++			&& $packet->actorRuntimeId === $this->player->getId()
++			&& $this->player->isAlive() && !$this->player->isSpectator()){
++			$this->player->swingArm();
++		}
++		return true;
+ 	}
+ 
+ 	public function handleContainerClose(ContainerClosePacket $packet) : bool{
+--- a/src/network/mcpe/handler/ItemStackRequestExecutor.php
++++ b/src/network/mcpe/handler/ItemStackRequestExecutor.php
+@@ -247,7 +247,7 @@
+ 			throw new ItemStackRequestProcessException("Cannot craft a recipe more than 256 times");
+ 		}
+ 		$craftingManager = $this->player->getServer()->getCraftingManager();
+-		$recipe = $craftingManager->getCraftingRecipeFromIndex($recipeId);
++		$recipe = $craftingManager->getCraftingRecipeFromIndex($recipeId - \pocketmine\network\mcpe\cache\CraftingDataCache::RECIPE_ID_OFFSET);
+ 		if($recipe === null){
+ 			throw new ItemStackRequestProcessException("No such crafting recipe index: $recipeId");
+ 		}
+--- a/src/network/mcpe/handler/PreSpawnPacketHandler.php
++++ b/src/network/mcpe/handler/PreSpawnPacketHandler.php
+@@ -94,6 +94,17 @@
+ 			}
+ 			$levelSettings->experiments = new Experiments([], false);
+ 
++			if($protocolId >= ProtocolInfo::PROTOCOL_1_26_62){ //1.26.60 exige esses 2 antes do StartGame, senão 'Dados de estrutura ausentes'
++				$this->session->sendDataPacket(\pocketmine\network\mcpe\protocol\JigsawStructureDataPacket::create(new CacheableNbt(
++					CompoundTag::create()
++						->setTag("processors", new \pocketmine\nbt\tag\ListTag([], \pocketmine\nbt\NBT::TAG_Compound))
++						->setTag("template_pools", new \pocketmine\nbt\tag\ListTag([], \pocketmine\nbt\NBT::TAG_Compound))
++						->setTag("jigsaws", new \pocketmine\nbt\tag\ListTag([], \pocketmine\nbt\NBT::TAG_Compound))
++						->setTag("structure_sets", new \pocketmine\nbt\tag\ListTag([], \pocketmine\nbt\NBT::TAG_Compound))
++				)));
++				$this->session->sendDataPacket(\pocketmine\network\mcpe\protocol\VoxelShapesPacket::create([], []));
++			}
++
+ 			$this->session->sendDataPacket(StartGamePacket::create(
+ 				$this->player->getId(),
+ 				$this->player->getId(),
+--- a/src/network/mcpe/protocol/AddActorPacket.php
++++ b/src/network/mcpe/protocol/AddActorPacket.php
+@@ -160,6 +160,9 @@
+ 		foreach($this->links as $link){
+ 			$out->putEntityLink($link);
+ 		}
++		if($out->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62){
++			$out->putBool(false); //PassengerOfBlock (1.26.60+)
++		}
+ 	}
+ 
+ 	public function handle(PacketHandlerInterface $handler) : bool{
+--- a/src/network/mcpe/protocol/AddPlayerPacket.php
++++ b/src/network/mcpe/protocol/AddPlayerPacket.php
+@@ -218,6 +218,9 @@
+ 			$out->putEntityLink($link);
+ 		}
+ 
++		if($out->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62){
++			$out->putBool(false); //PassengerOfBlock (1.26.60+)
++		}
+ 		$out->putString($this->deviceId);
+ 		if($out->getProtocolId() >= ProtocolInfo::PROTOCOL_1_13_0){
+ 			$out->putLInt($this->buildPlatform);
+--- a/src/network/mcpe/protocol/AnimatePacket.php
++++ b/src/network/mcpe/protocol/AnimatePacket.php
+@@ -43,6 +43,7 @@
+ 	public int $actorRuntimeId;
+ 	public float $data = 0.0;
+ 	public ?string $swingSource = null;
++	public int $hand = 0;
+ 
+ 	public static function create(int $actorRuntimeId, int $actionId, float $data = 0.0, ?string $swingSource = null) : self{
+ 		$result = new self();
+@@ -75,6 +76,9 @@
+ 		if($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_21_130){
+ 			$this->swingSource = $in->readOptional($in->getString(...));
+ 		}
++		if($in->getProtocolId() >= \pocketmine\network\mcpe\protocol\ProtocolInfo::PROTOCOL_1_26_62){
++			$this->hand = $in->getByte();
++		}
+ 	}
+ 
+ 	protected function encodePayload(PacketSerializer $out) : void{
+@@ -92,6 +96,9 @@
+ 		if($out->getProtocolId() >= ProtocolInfo::PROTOCOL_1_21_130){
+ 			$out->writeOptional($this->swingSource, $out->putString(...));
+ 		}
++		if($out->getProtocolId() >= \pocketmine\network\mcpe\protocol\ProtocolInfo::PROTOCOL_1_26_62){
++			$out->putByte($this->hand);
++		}
+ 	}
+ 
+ 	public function handle(PacketHandlerInterface $handler) : bool{
+--- a/src/network/mcpe/protocol/InventoryTransactionPacket.php
++++ b/src/network/mcpe/protocol/InventoryTransactionPacket.php
+@@ -80,11 +80,12 @@
+ 			}
+ 		}
+ 
+-		if($is2630){
++		$dummy = $is2630 && $in->getProtocolId() < \pocketmine\network\mcpe\protocol\ProtocolInfo::PROTOCOL_1_26_62;
++		if($dummy){
+ 			$in->readDummyOptional();
+ 		}
+ 		$transactionType = $in->getUnsignedVarInt();
+-		if($is2630){
++		if($dummy){
+ 			$in->readDummyOptional();
+ 		}
+ 
+@@ -121,7 +122,7 @@
+ 			}
+ 		}
+ 
+-		if($is2630){
++		if($is2630 && $out->getProtocolId() < \pocketmine\network\mcpe\protocol\ProtocolInfo::PROTOCOL_1_26_62){
+ 			$out->writeDummyOptional();
+ 			$out->putUnsignedVarInt($this->trData->getTypeId());
+ 			$out->writeDummyOptional();
+--- a/src/network/mcpe/protocol/LevelChunkPacket.php
++++ b/src/network/mcpe/protocol/LevelChunkPacket.php
+@@ -191,6 +191,9 @@
+ 			}
+ 		}
+ 		$out->putString($this->extraPayload);
++		if($out->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62){
++			$out->putBool(false); //ClientBiomeUpdate added in 1.26.60 (proto 2225)
++		}
+ 	}
+ 
+ 	public function handle(PacketHandlerInterface $handler) : bool{
+--- a/src/network/mcpe/protocol/PlayerAuthInputPacket.php
++++ b/src/network/mcpe/protocol/PlayerAuthInputPacket.php
+@@ -344,7 +344,7 @@
+ 		$this->headYaw = $in->getLFloat();
+ 		if($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_40){
+ 			$this->inputFlags = 0;
+-			if($in->getBool()){
++			if($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62 || $in->getBool()){
+ 				for($i = 0, $count = $in->getUnsignedVarInt(); $i < $count; ++$i){
+ 					$flag = $in->getVarInt();
+ 					if($flag < 0 || $flag >= PlayerAuthInputFlags::NUMBER_OF_FLAGS || isset($this->sparseInputFlags[$flag])){
+@@ -376,13 +376,13 @@
+ 		}
+ 
+ 		if($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_40){
+-			if($in->getBool()){
++			if($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62 || $in->getBool()){
+ 				$this->itemInteractionData = $in->readOptional(fn() => ItemInteractionData::read($in));
+ 			}
+-			if($in->getBool()){
++			if($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62 || $in->getBool()){
+ 				$this->itemStackRequest = $in->readOptional(fn() => ItemStackRequest::read($in));
+ 			}
+-			if($in->getBool()){
++			if($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62 || $in->getBool()){
+ 				$this->blockActions = $in->readOptional(function() use ($in) : array{
+ 					$result = [];
+ 					for($i = 0, $count = $in->getUnsignedVarInt(); $i < $count; ++$i){
+@@ -395,8 +395,8 @@
+ 					return $result;
+ 				});
+ 			}
+-			$vehicleRotation = $in->getBool() ? $in->readOptional(fn() => $in->getVector2()) : null;
+-			$vehicleActorUniqueId = $in->getBool() ? $in->readOptional(fn() => $in->getActorUniqueId()) : null;
++			$vehicleRotation = ($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62 || $in->getBool()) ? $in->readOptional(fn() => $in->getVector2()) : null;
++			$vehicleActorUniqueId = ($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62 || $in->getBool()) ? $in->readOptional(fn() => $in->getActorUniqueId()) : null;
+ 			if(($vehicleRotation === null) !== ($vehicleActorUniqueId === null)){
+ 				throw new PacketDecodeException("Vehicle rotation and actor unique ID must both be present or absent");
+ 			}
+--- a/src/network/mcpe/protocol/PlayerListPacket.php
++++ b/src/network/mcpe/protocol/PlayerListPacket.php
+@@ -150,6 +150,9 @@
+ 					$out->putActorUniqueId($entry->actorUniqueId);
+ 					$out->putString($entry->username);
+ 					$out->putString($entry->xboxUserId);
++					if($out->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62){
++						$out->putString($entry->skinData->getPlayFabId());
++					}
+ 					$out->putString($entry->platformChatId);
+ 					$out->putLInt($entry->buildPlatform);
+ 					$out->putSkin($entry->skinData);
+--- a/src/network/mcpe/protocol/ProtocolInfo.php
++++ b/src/network/mcpe/protocol/ProtocolInfo.php
+@@ -51,6 +51,7 @@
+ 
+ 	/** Actual Minecraft: PE protocol version */
+ 
++	public const PROTOCOL_1_26_62 = 2225;
+ 	public const PROTOCOL_1_26_45 = 2169;
+ 	public const PROTOCOL_1_26_40 = 2168;
+ 	public const PROTOCOL_1_26_30 = 1001;
+@@ -111,7 +112,7 @@
+ 	public const PROTOCOL_1_13_0 = 388;
+ 	public const PROTOCOL_1_12_0 = 361;
+ 
+-	public const CURRENT_PROTOCOL = self::PROTOCOL_1_26_45;
++	public const CURRENT_PROTOCOL = self::PROTOCOL_1_26_62;
+ 	public const ACCEPTED_PROTOCOL = [
+ 		self::PROTOCOL_1_12_0,
+ 		self::PROTOCOL_1_13_0,
+@@ -169,15 +170,16 @@
+ 		self::PROTOCOL_1_26_20,
+ 		self::PROTOCOL_1_26_30,
+ 		self::PROTOCOL_1_26_40,
++		self::PROTOCOL_1_26_45,
+ 		self::CURRENT_PROTOCOL
+ 	];
+ 
+ 	/** Display version shown in the server logs. This should match the version on the game's home screen. */
+-	public const MINECRAFT_VERSION = 'v26.45';
++	public const MINECRAFT_VERSION = 'v26.62';
+ 	/** Earliest Minecraft version supported by this server. */
+ 	public const MINECRAFT_VERSION_MIN = 'v1.12.0';
+ 	/** Version sent on the network for client side compatibility checks. This may differ from the display version. */
+-	public const MINECRAFT_VERSION_NETWORK = '1.26.45';
++	public const MINECRAFT_VERSION_NETWORK = '1.26.62';
+ 
+ 	/**
+ 	 * @var string[]
+--- a/src/network/mcpe/protocol/serializer/PacketSerializer.php
++++ b/src/network/mcpe/protocol/serializer/PacketSerializer.php
+@@ -453,7 +453,7 @@
+ 
+ 		$this->putString($skin->getSkinId());
+ 
+-		if($this->getProtocolId() >= ProtocolInfo::PROTOCOL_1_16_210){
++		if($this->getProtocolId() >= ProtocolInfo::PROTOCOL_1_16_210 && $this->getProtocolId() < ProtocolInfo::PROTOCOL_1_26_62){
+ 			$this->putString($skin->getPlayFabId());
+ 		}
+ 
+@@ -1475,6 +1475,9 @@
+ 
+ 	/** 1.26.40 wraps some optionals in a mandatory-present outer optional. */
+ 	public function readDummyOptional() : void{
++		if($this->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62){
++			return;
++		}
+ 		$dummy = $this->getByte();
+ 		if($dummy !== 1){
+ 			throw new PacketDecodeException("Dummy optional first byte should be 1, got $dummy");
+@@ -1482,6 +1485,9 @@
+ 	}
+ 
+ 	public function writeDummyOptional() : void{
++		if($this->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62){
++			return;
++		}
+ 		$this->putByte(1);
+ 	}
+ 
+--- a/src/network/mcpe/protocol/types/ItemInteractionData.php
++++ b/src/network/mcpe/protocol/types/ItemInteractionData.php
+@@ -59,7 +59,7 @@
+ 	public static function read(PacketSerializer $in) : self{
+ 		$requestId = $in->getVarInt();
+ 		$requestChangedSlots = [];
+-		if($requestId !== 0){
++		if(($in->getProtocolId() >= \pocketmine\network\mcpe\protocol\ProtocolInfo::PROTOCOL_1_26_62) ? $in->getBool() : ($requestId !== 0)){
+ 			$len = $in->getUnsignedVarInt();
+ 			for($i = 0; $i < $len; ++$i){
+ 				$requestChangedSlots[] = InventoryTransactionChangedSlotsHack::read($in);
+--- a/src/network/mcpe/protocol/types/LevelSettings.php
++++ b/src/network/mcpe/protocol/types/LevelSettings.php
+@@ -229,6 +229,9 @@
+ 			$out->putBool($this->createdInEditorMode);
+ 			$out->putBool($this->exportedFromEditorMode);
+ 		}
++		if($out->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62){
++			$out->putByte(0); //EditorLevelMigrationVersion added in 1.26.60 (proto 2225)
++		}
+ 		$out->putVarInt($this->time);
+ 		$out->putVarInt($this->eduEditionOffer);
+ 		$out->putBool($this->hasEduFeaturesEnabled);
+--- a/src/network/mcpe/protocol/types/inventory/NetworkInventoryAction.php
++++ b/src/network/mcpe/protocol/types/inventory/NetworkInventoryAction.php
+@@ -89,7 +89,10 @@
+ 		$this->sourceType = $packet->getUnsignedVarInt();
+ 
+ 		if($packet->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_30){
+-			if($packet->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_40){
++			if($packet->getProtocolId() >= \pocketmine\network\mcpe\protocol\ProtocolInfo::PROTOCOL_1_26_62){
++				$this->windowId = $packet->readOptional(fn() => Binary::signByte($packet->getByte()));
++				$this->sourceFlags = $packet->readOptional(fn() => $packet->getUnsignedVarInt());
++			}elseif($packet->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_40){
+ 				$this->windowId = $packet->readOptional(fn() => $packet->readOptional(fn() => Binary::signByte($packet->getByte())));
+ 				$this->sourceFlags = $packet->readOptional(fn() => $packet->readOptional(fn() => $packet->getUnsignedVarInt()));
+ 			}else{
+@@ -142,8 +145,13 @@
+ 		$this->sourceType = $packet->getUnsignedVarInt();
+ 
+ 		if($packet->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_40){
+-			$this->windowId = $packet->readOptional(fn() => $packet->readOptional(fn() => Binary::signByte($packet->getByte())));
+-			$this->sourceFlags = $packet->readOptional(fn() => $packet->readOptional(fn() => $packet->getUnsignedVarInt()));
++			if($packet->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62){
++				$this->windowId = $packet->readOptional(fn() => Binary::signByte($packet->getByte()));
++				$this->sourceFlags = $packet->readOptional(fn() => $packet->getUnsignedVarInt());
++			}else{
++				$this->windowId = $packet->readOptional(fn() => $packet->readOptional(fn() => Binary::signByte($packet->getByte())));
++				$this->sourceFlags = $packet->readOptional(fn() => $packet->readOptional(fn() => $packet->getUnsignedVarInt()));
++			}
+ 			$this->inventorySlot = $packet->getUnsignedVarInt();
+ 			$this->oldItem = $packet->getNetworkItemStackDescriptor();
+ 			$this->newItem = $packet->getNetworkItemStackDescriptor();
+@@ -181,8 +189,13 @@
+ 		$packet->putUnsignedVarInt($this->sourceType);
+ 
+ 		if($packet->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_40){
+-			$packet->writeOptional($this->windowId, fn(int $windowId) => $packet->writeOptional($windowId, fn(int $v) => $packet->putByte(Binary::unsignByte($v))));
+-			$packet->writeOptional($this->sourceFlags, fn(int $sourceFlags) => $packet->writeOptional($sourceFlags, fn(int $v) => $packet->putUnsignedVarInt($v)));
++			if($packet->getProtocolId() >= \pocketmine\network\mcpe\protocol\ProtocolInfo::PROTOCOL_1_26_62){
++				$packet->writeOptional($this->windowId, fn(int $v) => $packet->putByte(Binary::unsignByte($v)));
++				$packet->writeOptional($this->sourceFlags, fn(int $v) => $packet->putUnsignedVarInt($v));
++			}else{
++				$packet->writeOptional($this->windowId, fn(int $windowId) => $packet->writeOptional($windowId, fn(int $v) => $packet->putByte(Binary::unsignByte($v))));
++				$packet->writeOptional($this->sourceFlags, fn(int $sourceFlags) => $packet->writeOptional($sourceFlags, fn(int $v) => $packet->putUnsignedVarInt($v)));
++			}
+ 			$packet->putUnsignedVarInt($this->inventorySlot);
+ 			$packet->putNetworkItemStackDescriptor($this->oldItem);
+ 			$packet->putNetworkItemStackDescriptor($this->newItem);
+@@ -219,8 +232,13 @@
+ 
+ 		if($packet->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_30){
+ 			if($packet->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_40){
+-				$packet->writeOptional($this->windowId, fn(int $windowId) => $packet->writeOptional($windowId, fn(int $v) => $packet->putByte(Binary::unsignByte($v))));
+-				$packet->writeOptional($this->sourceFlags, fn(int $sourceFlags) => $packet->writeOptional($sourceFlags, fn(int $v) => $packet->putUnsignedVarInt($v)));
++				if($packet->getProtocolId() >= \pocketmine\network\mcpe\protocol\ProtocolInfo::PROTOCOL_1_26_62){
++					$packet->writeOptional($this->windowId, fn(int $v) => $packet->putByte(Binary::unsignByte($v)));
++					$packet->writeOptional($this->sourceFlags, fn(int $v) => $packet->putUnsignedVarInt($v));
++				}else{
++					$packet->writeOptional($this->windowId, fn(int $windowId) => $packet->writeOptional($windowId, fn(int $v) => $packet->putByte(Binary::unsignByte($v))));
++					$packet->writeOptional($this->sourceFlags, fn(int $sourceFlags) => $packet->writeOptional($sourceFlags, fn(int $v) => $packet->putUnsignedVarInt($v)));
++				}
+ 			}else{
+ 				$packet->writeDummyOptional();
+ 				$packet->writeOptional($this->windowId, fn(int $v) => $packet->putByte(Binary::unsignByte($v)));
+--- a/src/network/mcpe/protocol/types/inventory/TransactionData.php
++++ b/src/network/mcpe/protocol/types/inventory/TransactionData.php
+@@ -89,6 +89,9 @@
+ 			for($i = 0; $i < $actionCount; ++$i){
+ 				$this->actions[] = (new NetworkInventoryAction())->readAuthInput($stream);
+ 			}
++			if($stream->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62){
++				$this->decodeData($stream);
++			}
+ 			return;
+ 		}
+ 
+--- a/src/network/mcpe/protocol/types/inventory/UseItemTransactionData.php
++++ b/src/network/mcpe/protocol/types/inventory/UseItemTransactionData.php
+@@ -48,6 +48,7 @@
+ 	private BlockPosition $blockPosition;
+ 	private int $face;
+ 	private int $hotbarSlot;
++	private int $hand = 0;
+ 	private ItemStackWrapper $itemInHand;
+ 	private Vector3 $playerPosition;
+ 	private Vector3 $clickPosition;
+@@ -102,6 +103,9 @@
+ 		$this->blockPosition = $stream->getBlockPosition($stream->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_10);
+ 		$this->face = $is2630 ? $stream->getByte() : $stream->getVarInt();
+ 		$this->hotbarSlot = $stream->getVarInt();
++		if($stream->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62){
++			$this->hand = $stream->getByte();
++		}
+ 		$this->itemInHand = $is2630
+ 			? $stream->getNetworkItemStackDescriptor(decodeExtraData: false)
+ 			: ItemStackWrapper::read($stream, decodeExtraData: false);
+@@ -137,6 +141,9 @@
+ 			$stream->putVarInt($this->face);
+ 		}
+ 		$stream->putVarInt($this->hotbarSlot);
++		if($stream->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62){
++			$stream->putByte($this->hand);
++		}
+ 		if($is2630){
+ 			$stream->putNetworkItemStackDescriptor($this->itemInHand);
+ 		}else{
+--- a/src/network/mcpe/protocol/types/inventory/stackrequest/DeprecatedCraftingResultsStackRequestAction.php
++++ b/src/network/mcpe/protocol/types/inventory/stackrequest/DeprecatedCraftingResultsStackRequestAction.php
+@@ -55,8 +55,25 @@
+ 
+ 	public static function read(PacketSerializer $in) : self{
+ 		$results = [];
+-		for($i = 0, $len = $in->getUnsignedVarInt(); $i < $len; ++$i){
+-			$results[] = $in->getItemStackWithoutStackId(false);
++		if($in->getProtocolId() >= \pocketmine\network\mcpe\protocol\ProtocolInfo::PROTOCOL_1_26_62){
++			//26.60: StackRequestItem por identificador; a acao e so informativa, entao le e descarta
++			for($i = 0, $len = $in->getUnsignedVarInt(); $i < $len; ++$i){
++				$variant = $in->getUnsignedVarInt();
++				$in->getByte(); //legacy variant
++				if($variant === 1){
++					$in->getString(); //identifier
++					$in->getVarInt(); //meta
++				}elseif($variant !== 0){
++					throw new \pocketmine\network\mcpe\protocol\PacketDecodeException("Unknown stack request item descriptor $variant");
++				}
++				$in->getLShort(); //count
++				$in->getUnsignedVarInt(); //block runtime id
++				$in->getString(); //user data
++			}
++		}else{
++			for($i = 0, $len = $in->getUnsignedVarInt(); $i < $len; ++$i){
++				$results[] = $in->getItemStackWithoutStackId(false);
++			}
+ 		}
+ 		$iterations = $in->getByte();
+ 		return new self($results, $iterations);
+--- a/src/network/mcpe/protocol/types/inventory/stackrequest/ItemStackRequest.php
++++ b/src/network/mcpe/protocol/types/inventory/stackrequest/ItemStackRequest.php
+@@ -96,6 +96,17 @@
+ 			if($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_40){
+ 				$typeId = ItemStackRequestActionType::fromModernTypeId($in->getUnsignedVarInt());
+ 				$in->getByte(); // legacy action type ID, retained by the client for compatibility
++				if($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62){
++					if($typeId === 18){
++						//26.60: CraftReserved (string reservedId + u8 numberOfCrafts), sem equivalente aqui: le e descarta
++						$in->getString();
++						$in->getByte();
++						continue;
++					}
++					if($typeId > 18){
++						$typeId--; //NonImplementedDeprecated 19->18, CraftResultsDeprecated 20->19
++					}
++				}
+ 			}else{
+ 				$typeId = $in->getByte();
+ 				if($typeId >= ItemStackRequestActionType::PLACE_INTO_BUNDLE && $in->getProtocolId() < ProtocolInfo::PROTOCOL_1_18_10){
+@@ -123,7 +134,11 @@
+ 		foreach($this->actions as $action){
+ 			$typeId = $action->getTypeId();
+ 			if($out->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_40){
+-				$out->putUnsignedVarInt(ItemStackRequestActionType::toModernTypeId($typeId));
++				$modern = ItemStackRequestActionType::toModernTypeId($typeId);
++				if($out->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62 && $typeId >= ItemStackRequestActionType::CRAFTING_NON_IMPLEMENTED_DEPRECATED_ASK_TY_LAING){
++					$modern++; //26.60 inseriu CraftReserved antes
++				}
++				$out->putUnsignedVarInt($modern);
+ 				$out->putByte($typeId);
+ 			}elseif($typeId >= ItemStackRequestActionType::PLACE_INTO_BUNDLE && $out->getProtocolId() < ProtocolInfo::PROTOCOL_1_18_10){
+ 				$typeId -= ItemStackRequestActionType::LAB_TABLE_COMBINE - ItemStackRequestActionType::PLACE_INTO_BUNDLE;
+--- a/src/network/mcpe/protocol/types/inventory/stackresponse/ItemStackResponse.php
++++ b/src/network/mcpe/protocol/types/inventory/stackresponse/ItemStackResponse.php
+@@ -62,7 +62,7 @@
+ 		$requestId = $in->readItemStackRequestId();
+ 		$containerInfos = [];
+ 		if($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_40){
+-			if($in->getBool() && $in->getBool()){
++			if($in->getBool() && ($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62 || $in->getBool())){
+ 				for($i = 0, $len = $in->getUnsignedVarInt(); $i < $len; ++$i){
+ 					$containerInfos[] = ItemStackResponseContainerInfo::read($in);
+ 				}
+@@ -82,7 +82,9 @@
+ 			$hasContainers = count($this->containerInfos) !== 0;
+ 			$out->putBool($hasContainers);
+ 			if($hasContainers){
+-				$out->putBool(true);
++				if($out->getProtocolId() < ProtocolInfo::PROTOCOL_1_26_62){
++					$out->putBool(true);
++				}
+ 				$out->putUnsignedVarInt(count($this->containerInfos));
+ 				foreach($this->containerInfos as $containerInfo){
+ 					$containerInfo->write($out);
+--- a/src/network/mcpe/protocol/types/inventory/stackresponse/ItemStackResponseSlotInfo.php
++++ b/src/network/mcpe/protocol/types/inventory/stackresponse/ItemStackResponseSlotInfo.php
+@@ -59,7 +59,7 @@
+ 		$hotbarSlot = $in->getByte();
+ 		$count = $in->getByte();
+ 		if($in->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_40){
+-			$itemStackId = $in->readDoubleOptional($in->readServerItemStackId(...));
++			$itemStackId = $in->getProtocolId() >= \pocketmine\network\mcpe\protocol\ProtocolInfo::PROTOCOL_1_26_62 ? $in->readOptional($in->readServerItemStackId(...)) : $in->readDoubleOptional($in->readServerItemStackId(...));
+ 		}else{
+ 			$itemStackId = $in->readServerItemStackId();
+ 		}
+@@ -82,7 +82,11 @@
+ 		$out->putByte($this->hotbarSlot);
+ 		$out->putByte($this->count);
+ 		if($out->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_40){
+-			$out->writeDoubleOptional($this->itemStackId, $out->writeServerItemStackId(...));
++			if($out->getProtocolId() >= \pocketmine\network\mcpe\protocol\ProtocolInfo::PROTOCOL_1_26_62){
++				$out->writeOptional($this->itemStackId, $out->writeServerItemStackId(...));
++			}else{
++				$out->writeDoubleOptional($this->itemStackId, $out->writeServerItemStackId(...));
++			}
+ 		}else{
+ 			$out->writeServerItemStackId($this->itemStackId ?? 0);
+ 		}
+--- a/src/network/mcpe/raklib/RakLibInterface.php
++++ b/src/network/mcpe/raklib/RakLibInterface.php
+@@ -226,7 +226,7 @@
+ 				//intentionally doesn't use logException, we don't want spammy packet error traces to appear in release mode
+ 				$logger->debug(implode("\n", Utils::printableExceptionInfo($e)));
+ 
+-				$this->interface->blockAddress($address, 5);
++				if($address !== '127.0.0.1'){ $this->interface->blockAddress($address, 5); }
+ 			}catch(\Throwable $e){
+ 				$this->server->getLogger()->emergency("Crash occurred while handling a packet from session: $name");
+ 				$this->server->getLogger()->emergency(get_class($e));
+--- a/src/network/mcpe/serializer/ChunkSerializer.php
++++ b/src/network/mcpe/serializer/ChunkSerializer.php
+@@ -132,7 +132,8 @@
+ 				$chunk->getSubChunk($y),
+ 				$typeConverter->getBlockTranslator(),
+ 				$subChunkStream,
+-				false
++				false,
++				$y
+ 			);
+ 			$subChunks[] = $subChunkStream->getBuffer();
+ 		}
+@@ -301,11 +302,16 @@
+ 		}
+ 	}
+ 
+-	public static function serializeSubChunk(SubChunk $subChunk, BlockTranslator $blockTranslator, PacketSerializer $stream, bool $persistentBlockStates) : void{
++	public static function serializeSubChunk(SubChunk $subChunk, BlockTranslator $blockTranslator, PacketSerializer $stream, bool $persistentBlockStates, int $subChunkY = 0) : void{
+ 		$layers = $subChunk->getBlockLayers();
+-		$stream->putByte(8); //version
+-
+-		$stream->putByte(count($layers));
++		if($stream->getProtocolId() >= ProtocolInfo::PROTOCOL_1_26_62){
++			$stream->putByte(9); //subchunk version 9 (1.26.60+)
++			$stream->putByte(count($layers));
++			$stream->putByte($subChunkY & 0xff); //subchunk Y index
++		}else{
++			$stream->putByte(8); //version
++			$stream->putByte(count($layers));
++		}
+ 
+ 		$blockStateDictionary = $blockTranslator->getBlockStateDictionary();
+ 
+--- a/src/player/Player.php
++++ b/src/player/Player.php
+@@ -298,6 +298,7 @@
+ 	protected string $locale = "en_US";
+ 
+ 	protected int $startAction = -1;
++	private int $lastArmSwingTick = -1;
+ 
+ 	/**
+ 	 * @phpstan-var array<int|string, int>
+@@ -1865,7 +1866,7 @@
+ 		if($ev->isCancelled()){
+ 			return false;
+ 		}
+-		$this->broadcastAnimation(new ArmSwingAnimation($this), $this->getViewers());
++		$this->swingArm();
+ 		if($target->onAttack($this->inventory->getItemInHand(), $face, $this)){
+ 			return true;
+ 		}
+@@ -1905,7 +1906,7 @@
+ 		$this->removeCurrentWindow();
+ 
+ 		if($this->canInteract($pos->add(0.5, 0.5, 0.5), $this->isCreative() ? self::MAX_REACH_DISTANCE_CREATIVE : self::MAX_REACH_DISTANCE_SURVIVAL)){
+-			$this->broadcastAnimation(new ArmSwingAnimation($this), $this->getViewers());
++			$this->swingArm();
+ 			$this->stopBreakBlock($pos);
+ 			$item = $this->inventory->getItemInHand();
+ 			$oldItem = clone $item;
+@@ -1931,7 +1932,7 @@
+ 		$this->setUsingItem(false);
+ 
+ 		if($this->canInteract($pos->add(0.5, 0.5, 0.5), $this->isCreative() ? self::MAX_REACH_DISTANCE_CREATIVE : self::MAX_REACH_DISTANCE_SURVIVAL)){
+-			$this->broadcastAnimation(new ArmSwingAnimation($this), $this->getViewers());
++			$this->swingArm();
+ 			$item = $this->inventory->getItemInHand(); //this is a copy of the real item
+ 			$oldItem = clone $item;
+ 			$returnedItems = [];
+@@ -2002,7 +2003,7 @@
+ 		}
+ 
+ 		$entity->attack($ev);
+-		$this->broadcastAnimation(new ArmSwingAnimation($this), $this->getViewers());
++		$this->swingArm();
+ 
+ 		$soundPos = $entity->getPosition()->add(0, $entity->size->getHeight() / 2, 0);
+ 		if($ev->isCancelled()){
+@@ -2053,7 +2054,7 @@
+ 		$ev->call();
+ 		if(!$ev->isCancelled()){
+ 			$this->broadcastSound(new EntityAttackNoDamageSound());
+-			$this->broadcastAnimation(new ArmSwingAnimation($this), $this->getViewers());
++			$this->swingArm();
+ 		}
+ 	}
+ 
+@@ -2175,7 +2176,7 @@
+ 	 * Drops an item on the ground in front of the player.
+ 	 */
+ 	public function dropItem(Item $item) : void{
+-		$this->broadcastAnimation(new ArmSwingAnimation($this), $this->getViewers());
++		$this->swingArm();
+ 		$this->getWorld()->dropItem($this->location->add(0, 1.3, 0), $item, $this->getDirectionVector()->multiply(0.4), 40);
+ 	}
+ 
+@@ -2661,6 +2662,18 @@
+ 		parent::sendData($targets, $data);
+ 	}
+ 
++	/**
++	 * Shows an arm swing to viewers. Multiple input paths may describe the same
++	 * swing, so broadcast at most one visual per server tick.
++	 */
++	public function swingArm() : void{
++		$currentTick = $this->server->getTick();
++		if($this->lastArmSwingTick !== $currentTick){
++			$this->lastArmSwingTick = $currentTick;
++			$this->broadcastAnimation(new ArmSwingAnimation($this), $this->getViewers());
++		}
++	}
++
+ 	public function broadcastAnimation(Animation $animation, ?array $targets = null) : void{
+ 		if($this->spawned && $targets === null){
+ 			$targets = $this->getViewers();
+--- a/src/player/SurvivalBlockBreakHandler.php
++++ b/src/player/SurvivalBlockBreakHandler.php
+@@ -27,7 +27,6 @@
+ namespace pocketmine\player;
+ 
+ use pocketmine\block\Block;
+-use pocketmine\entity\animation\ArmSwingAnimation;
+ use pocketmine\entity\effect\VanillaEffects;
+ use pocketmine\item\enchantment\VanillaEnchantments;
+ use pocketmine\math\Facing;
+@@ -116,7 +115,7 @@
+ 		if(($this->fxTicker++ % $this->fxTickInterval) === 0 && $this->breakProgress < 1){
+ 			$this->player->getWorld()->addParticle($this->blockPos, new BlockPunchParticle($this->block, $this->targetedFace));
+ 			$this->player->getWorld()->addSound($this->blockPos, new BlockPunchSound($this->block));
+-			$this->player->broadcastAnimation(new ArmSwingAnimation($this->player), $this->player->getViewers());
++			$this->player->swingArm();
+ 		}
+ 
+ 		return $this->breakProgress < 1;
