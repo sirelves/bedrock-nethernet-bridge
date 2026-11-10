@@ -122,6 +122,14 @@ Essential is licensed **LGPL-3.0-or-later** (inherited from PocketMine-MP). The 
 version distributed under the same license; its full source is inside the phar and the modifications are in
 this repository. See [essential/README.md](essential/README.md).
 
+### No bridge needed: Essential with native NetherNet
+
+[sirelves/Essential](https://github.com/sirelves/Essential) (branch `nethernet-1.26.62`) is the same 1.26.62 port
+plus a **native NetherNet transport** (ported from axolotl-pm/PocketMine-MP): 26.60+ clients join the server directly,
+with their real IP, and this bridge is not needed. It requires the `ext-webrtc` PHP extension; a prebuilt one for the
+PocketMine PHP 8.4 ZTS binary (Linux x86_64) is in its
+[release](https://github.com/sirelves/Essential/releases). Setup: [NETHERNET.md](https://github.com/sirelves/Essential/blob/nethernet-1.26.62/NETHERNET.md).
+
 ## Limitations
 
 - Protocol **2225** only (Bedrock 1.26.60–1.26.62). Bedrock 26.70 (in preview) uses a newer protocol.

@@ -94,6 +94,14 @@ bloco, chat, comandos, crafting pelo livro de receitas, baús, morte e respawn.
 O Essential é **LGPL-3.0-or-later** (herdado do PocketMine-MP). O phar corrigido é uma versão modificada distribuída
 sob a mesma licença. Veja [essential/README.md](essential/README.md).
 
+### Sem bridge: Essential com NetherNet nativo
+
+O [sirelves/Essential](https://github.com/sirelves/Essential) (branch `nethernet-1.26.62`) é o mesmo porte 1.26.62
+com **NetherNet nativo** (portado do axolotl-pm/PocketMine-MP): clientes 26.60+ entram direto no servidor, com o IP
+real, e este bridge deixa de ser necessário. Precisa da extensão PHP `ext-webrtc`; uma já compilada pro PHP 8.4 ZTS do
+PocketMine (Linux x86_64) está na [release](https://github.com/sirelves/Essential/releases). Configuração:
+[NETHERNET.md](https://github.com/sirelves/Essential/blob/nethernet-1.26.62/NETHERNET.md).
+
 ## Limitações
 
 - Só o protocolo **2225** (Bedrock 1.26.60–1.26.62). O 26.70 (em preview) usa outro protocolo.
