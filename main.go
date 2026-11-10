@@ -37,6 +37,7 @@ var version = "dev"
 type config struct {
 	httpAddr, udpAddr, publicIP, upstream, keyFile string
 
+	injectPreJoin bool
 }
 
 func main() {
@@ -46,6 +47,7 @@ func main() {
 	flag.StringVar(&cfg.publicIP, "public-ip", "", "public IPv4 announced in ICE candidates (required)")
 	flag.StringVar(&cfg.upstream, "upstream", "127.0.0.1:19132", "RakNet server to relay to")
 	flag.StringVar(&cfg.keyFile, "key", "server-identity.pem", "persistent ECDSA key for the server identity (clients pin it on first join over HTTP)")
+	flag.BoolVar(&cfg.injectPreJoin, "inject-prejoin", true, "inject JigsawStructureData + VoxelShapes before StartGame when the upstream does not send them (required by 26.60 clients)")
 	debug := flag.Bool("debug", false, "verbose logging (WebRTC/ICE/DTLS/SCTP)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -181,6 +183,12 @@ func relay(log *slog.Logger, cfg config, nn *nethernet.Conn) {
 				continue
 			}
 			batch := pk[1:]
+			if cfg.injectPreJoin {
+				if nb, ok := injectPreJoin(batch); ok {
+					batch = nb
+					log.Info("injected JigsawStructureData + VoxelShapes before StartGame")
+				}
+			}
 			if _, err := nn.Write(batch); err != nil {
 				done <- err
 				return
