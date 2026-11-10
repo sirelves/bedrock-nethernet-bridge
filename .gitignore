@@ -1,0 +1,10 @@
+# binaries
+/nethernet-bridge
+/dist/
+*.exe
+
+# server identity key (keep it private, back it up on the server)
+*.pem
+
+# diagnostics output
+/dumps/
